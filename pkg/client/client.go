@@ -363,28 +363,55 @@ func CallDeviceAccessTokenEndpoint(ctx context.Context, request *DeviceAccessTok
 	return CallDeviceAccessTokenEndpointWithAuthFn(ctx, request, caller, nil)
 }
 
+// devicePollBackoff is the increment added to the polling interval — and to
+// the per-request timeout derived from it — each time the token endpoint
+// answers slow_down (RFC 8628, section 3.5 mandates 5 seconds) or a single
+// poll request exceeds its transport timeout. It is a package variable so
+// tests can shorten the backoff instead of waiting seconds per round.
+var devicePollBackoff = 5 * time.Second
+
 // PollDeviceAccessTokenEndpointWithAuthFn polls the device access token endpoint, accepting an authFn for custom authentication.
+//
+// Polling continues while the endpoint answers authorization_pending or
+// slow_down, and recovers when a single poll request exceeds its transport
+// timeout: a slow token endpoint must not abort the whole device
+// authorization flow. Both slow_down responses and transport timeouts back
+// off cumulatively by devicePollBackoff, which grows the wait between rounds
+// and the timeout of every subsequent request. Any other transport failure
+// (connection refused, DNS, TLS, ...) is returned immediately: unlike a
+// timeout it does not indicate a merely slow endpoint, and RFC 8628 defines
+// no recovery for it — retrying would only delay surfacing a persistent
+// configuration or network problem to the user.
 func PollDeviceAccessTokenEndpointWithAuthFn(ctx context.Context, interval time.Duration, request *DeviceAccessTokenRequest, caller TokenEndpointCaller, authFn any) (*oidc.AccessTokenResponse, error) {
 	ctx, span := Tracer.Start(ctx, "PollDeviceAccessTokenEndpoint")
 	defer span.End()
 
 	for {
-		timer := time.After(interval)
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return nil, ctx.Err()
-		case <-timer:
+		case <-timer.C:
 		}
 
-		ctx, cancel := context.WithTimeout(ctx, interval)
-		defer cancel()
-
-		resp, err := CallDeviceAccessTokenEndpointWithAuthFn(ctx, request, caller, authFn)
+		// Each round gets its own request context with the current interval as
+		// timeout, and cancel is called when the round ends — timer resources
+		// are released per round and never leak across rounds.
+		reqCtx, cancel := context.WithTimeout(ctx, interval)
+		resp, err := CallDeviceAccessTokenEndpointWithAuthFn(reqCtx, request, caller, authFn)
+		cancel()
 		if err == nil {
 			return resp, nil
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			interval += 5 * time.Second
+			// The poll context itself being done is not a recoverable
+			// per-round timeout.
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			interval += devicePollBackoff
+			continue
 		}
 		var target *oidc.Error
 		if !errors.As(err, &target) {
@@ -394,7 +421,7 @@ func PollDeviceAccessTokenEndpointWithAuthFn(ctx context.Context, interval time.
 		case oidc.AuthorizationPending:
 			continue
 		case oidc.SlowDown:
-			interval += 5 * time.Second
+			interval += devicePollBackoff
 			continue
 		default:
 			return nil, err
